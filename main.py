@@ -282,7 +282,7 @@ class BookletScraper:
             if file_path.exists():
                 file_path.unlink()
 
-            # 初始化图片下载器
+            # 初始化图片下载器 - 图片保存在输出目录下的img文件夹
             if self.config.download_images:
                 img_dir = self.output_dir / "img"
                 self.image_downloader = ImageDownloader(self.api.session, img_dir)
@@ -292,6 +292,12 @@ class BookletScraper:
             # 多文件模式：创建子目录
             dir_path = self.output_dir / safe_title
             dir_path.mkdir(exist_ok=True)
+
+            # 初始化图片下载器 - 图片保存在书籍目录下的img文件夹
+            if self.config.download_images:
+                img_dir = dir_path / "img"
+                self.image_downloader = ImageDownloader(self.api.session, img_dir)
+
             return dir_path
 
     def _write_single_file_header(self, book_title: str, sections: Dict[str, str]) -> None:
@@ -325,6 +331,10 @@ class BookletScraper:
 
     def _write_section_to_separate_file(self, title: str, content: str, index: int) -> None:
         """将章节保存为独立文件"""
+        # 处理图片下载和链接替换
+        if content and self.image_downloader:
+            content = self.image_downloader.extract_and_download_images(content)
+
         safe_title = self._sanitize_filename(title)
         file_name = f"{index:03d}_{safe_title}.md"
         file_path = self.book_output_path / file_name
@@ -410,7 +420,7 @@ class BookletScraper:
                         self.logger.warning(f"✗ 章节 '{title}' 获取失败")
 
             # 输出图片下载统计
-            if self.merge_single_file and self.image_downloader:
+            if self.image_downloader:
                 img_count = len(self.image_downloader.downloaded_images)
                 self.logger.info(f"共下载图片 {img_count} 张")
 
