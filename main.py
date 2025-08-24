@@ -3,14 +3,18 @@
 """
 掘金小册内容爬虫
 功能：获取掘金小册的所有章节内容并合并为一个Markdown文件或拆分为多个文件
+新增：支持下载图片并替换链接
 """
 
 import time
 import logging
+import re
+import hashlib
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, urljoin
 
 import requests
 import configparser
@@ -29,6 +33,122 @@ class BookletConfig:
     auto_title: bool = True
     auto_all: bool = True
     merge_single_file: bool = True  # 新增：是否合并为单个文件
+    download_images: bool = True  # 新增：是否下载图片
+
+
+class ImageDownloader:
+    """图片下载器"""
+
+    def __init__(self, session: requests.Session, img_dir: Path):
+        self.session = session
+        self.img_dir = img_dir
+        self.img_dir.mkdir(exist_ok=True)
+        self.downloaded_images = {}  # URL -> local_path 映射
+
+    def _get_image_extension(self, url: str, content_type: str = None) -> str:
+        """根据URL或content-type获取图片扩展名"""
+        # 优先从content-type获取
+        if content_type:
+            if 'jpeg' in content_type or 'jpg' in content_type:
+                return '.jpg'
+            elif 'png' in content_type:
+                return '.png'
+            elif 'gif' in content_type:
+                return '.gif'
+            elif 'webp' in content_type:
+                return '.webp'
+
+        # 从URL获取扩展名
+        path = urlparse(url).path
+        if '.' in path:
+            ext = path.split('.')[-1].lower()
+            if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg']:
+                return f'.{ext}'
+
+        # 默认使用jpg
+        return '.jpg'
+
+    def _generate_filename(self, url: str, ext: str) -> str:
+        """生成唯一的文件名"""
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        return f"image_{url_hash}{ext}"
+
+    def download_image(self, url: str) -> Optional[str]:
+        """下载单张图片，返回本地相对路径"""
+        if url in self.downloaded_images:
+            return self.downloaded_images[url]
+
+        try:
+            # 处理相对URL
+            if not url.startswith(('http://', 'https://')):
+                url = urljoin('https://juejin.cn/', url)
+
+            response = self.session.get(url, timeout=10, stream=True)
+            response.raise_for_status()
+
+            # 获取文件扩展名
+            content_type = response.headers.get('content-type', '')
+            ext = self._get_image_extension(url, content_type)
+
+            # 生成文件名
+            filename = self._generate_filename(url, ext)
+            file_path = self.img_dir / filename
+
+            # 保存图片
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            # 返回相对路径
+            relative_path = f"img/{filename}"
+            self.downloaded_images[url] = relative_path
+
+            logging.info(f"图片下载成功: {url} -> {relative_path}")
+            return relative_path
+
+        except Exception as e:
+            logging.warning(f"图片下载失败: {url}, 错误: {e}")
+            return None
+
+    def extract_and_download_images(self, content: str) -> str:
+        """提取并下载markdown内容中的所有图片"""
+        if not content:
+            return content
+
+        # 匹配markdown图片语法: ![alt](url) 和 <img src="url">
+        img_patterns = [
+            r'!\[([^\]]*)\]\(([^)]+)\)',  # markdown格式
+            r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>',  # html格式
+        ]
+
+        modified_content = content
+
+        for pattern in img_patterns:
+            matches = re.findall(pattern, modified_content)
+
+            for match in matches:
+                if len(match) == 2:  # markdown格式
+                    alt_text, img_url = match
+                    local_path = self.download_image(img_url.strip())
+                    if local_path:
+                        old_pattern = f'![{alt_text}]({img_url})'
+                        new_pattern = f'![{alt_text}]({local_path})'
+                        modified_content = modified_content.replace(old_pattern, new_pattern)
+
+                elif len(match) == 1:  # html格式
+                    img_url = match[0]
+                    local_path = self.download_image(img_url.strip())
+                    if local_path:
+                        # 替换src属性
+                        old_src = f'src="{img_url}"'
+                        new_src = f'src="{local_path}"'
+                        modified_content = modified_content.replace(old_src, new_src)
+
+                        old_src = f"src='{img_url}'"
+                        new_src = f"src='{local_path}'"
+                        modified_content = modified_content.replace(old_src, new_src)
+
+        return modified_content
 
 
 class JuejinAPI:
@@ -129,6 +249,7 @@ class BookletScraper:
         self.output_dir = Path(config.output_dir)
         self.book_output_path = None  # 单个文件路径 或 目录路径
         self.merge_single_file = config.merge_single_file
+        self.image_downloader = None
 
         self._setup_logging()
         self.logger = logging.getLogger(__name__)
@@ -160,6 +281,12 @@ class BookletScraper:
             file_path = self.output_dir / f"{safe_title}.md"
             if file_path.exists():
                 file_path.unlink()
+
+            # 初始化图片下载器
+            if self.config.download_images:
+                img_dir = self.output_dir / "img"
+                self.image_downloader = ImageDownloader(self.api.session, img_dir)
+
             return file_path
         else:
             # 多文件模式：创建子目录
@@ -183,6 +310,10 @@ class BookletScraper:
 
     def _write_section_to_single_file(self, title: str, content: str) -> None:
         """写入章节到单个文件"""
+        # 处理图片下载和链接替换
+        if content and self.image_downloader:
+            content = self.image_downloader.extract_and_download_images(content)
+
         with open(self.book_output_path, 'a', encoding='utf-8') as f:
             if self.config.auto_title:
                 f.write(f"\n\n# {title}\n\n")
@@ -278,6 +409,11 @@ class BookletScraper:
                     else:
                         self.logger.warning(f"✗ 章节 '{title}' 获取失败")
 
+            # 输出图片下载统计
+            if self.merge_single_file and self.image_downloader:
+                img_count = len(self.image_downloader.downloaded_images)
+                self.logger.info(f"共下载图片 {img_count} 张")
+
             self.logger.info(f"爬取完成！成功获取 {success_count}/{len(sections)} 个章节")
             self.logger.info(f"输出路径: {self.book_output_path.absolute()}")
 
@@ -303,7 +439,8 @@ def load_config(config_file: str = 'config.ini') -> BookletConfig:
         request_delay=config.getfloat('settings', 'request_delay', fallback=0.5),
         auto_title=config.getboolean('out', 'auto_title', fallback=True),
         auto_all=config.getboolean('book', 'auto_all', fallback=True),
-        merge_single_file=config.getboolean('out', 'merge_single_file', fallback=True),  # 新增
+        merge_single_file=config.getboolean('out', 'merge_single_file', fallback=True),
+        download_images=config.getboolean('out', 'download_images', fallback=True),  # 新增
     )
 
 
