@@ -24,6 +24,7 @@ from urllib3.util.retry import Retry
 
 from typing import List
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 @dataclass
 class BookletConfig:
     """小册配置类"""
@@ -40,13 +41,13 @@ class BookletConfig:
 
 
 class ImageDownloader:
-    """图片下载器"""
 
-    def __init__(self, session: requests.Session, img_dir: Path):
+    def __init__(self, session: requests.Session, img_dir: Path, config: BookletConfig):
         self.session = session
         self.img_dir = img_dir
+        self.config = config  # 保存 config 引用
         self.img_dir.mkdir(exist_ok=True)
-        self.downloaded_images = {}  # URL -> local_path 映射
+        self.downloaded_images = {}
 
     def _get_image_extension(self, url: str, content_type: str = None) -> str:
         """根据URL或content-type获取图片扩展名"""
@@ -114,45 +115,75 @@ class ImageDownloader:
             return None
 
     def extract_and_download_images(self, content: str) -> str:
-        """提取并下载markdown内容中的所有图片"""
-        if not content:
+        """提取并并发下载markdown内容中的所有图片"""
+        if not content or not self.config.download_images:
             return content
 
-        # 匹配markdown图片语法: ![alt](url) 和 <img src="url">
+        # 匹配图片链接
         img_patterns = [
-            r'!\[([^\]]*)\]\(([^)]+)\)',  # markdown格式
-            r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>',  # html格式
+            r'!\[([^\]]*)\]\(([^)]+)\)',  # ![alt](url)
+            r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>',  # <img src="url">
         ]
 
-        modified_content = content
+        # 存储所有待处理的图片任务: (full_match, alt_text, img_url, is_markdown)
+        image_tasks = []
 
         for pattern in img_patterns:
-            matches = re.findall(pattern, modified_content)
-
+            matches = re.findall(pattern, content)
             for match in matches:
-                if len(match) == 2:  # markdown格式
+                if len(match) == 2:  # Markdown 格式
                     alt_text, img_url = match
-                    local_path = self.download_image(img_url.strip())
-                    if local_path:
-                        old_pattern = f'![{alt_text}]({img_url})'
-                        new_pattern = f'![{alt_text}]({local_path})'
-                        modified_content = modified_content.replace(old_pattern, new_pattern)
-
-                elif len(match) == 1:  # html格式
+                    image_tasks.append(('md', match, alt_text, img_url.strip()))
+                elif len(match) == 1:  # HTML 格式
                     img_url = match[0]
-                    local_path = self.download_image(img_url.strip())
-                    if local_path:
-                        # 替换src属性
-                        old_src = f'src="{img_url}"'
-                        new_src = f'src="{local_path}"'
-                        modified_content = modified_content.replace(old_src, new_src)
+                    image_tasks.append(('html', match[0], '', img_url.strip()))
 
-                        old_src = f"src='{img_url}'"
-                        new_src = f"src='{local_path}'"
-                        modified_content = modified_content.replace(old_src, new_src)
+        # 去重：只处理未下载过的图片
+        unique_tasks = []
+        for task_type, original, alt_text, img_url in image_tasks:
+            if img_url not in self.downloaded_images:
+                unique_tasks.append((task_type, original, alt_text, img_url))
+
+        if not unique_tasks:
+            return content  # 所有图片已下载
+
+        # 多线程下载图片
+        def download_task(img_url: str) -> Tuple[str, Optional[str]]:
+            local_path = self.download_image(img_url)
+            return img_url, local_path
+
+        downloaded_results = {}
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+            futures = [executor.submit(download_task, task[3]) for task in unique_tasks]
+            for future in as_completed(futures):
+                try:
+                    img_url, local_path = future.result()
+                    downloaded_results[img_url] = local_path
+                except Exception as e:
+                    logging.warning(f"多线程图片下载异常: {e}")
+
+        # 更新已下载映射
+        for img_url, local_path in downloaded_results.items():
+            if local_path:
+                self.downloaded_images[img_url] = local_path
+
+        # 替换原始内容中的图片链接
+        modified_content = content
+        for task_type, original, alt_text, img_url in image_tasks:
+            local_path = self.downloaded_images.get(img_url)
+            if not local_path:
+                continue  # 下载失败，保留原链接
+
+            if task_type == 'md':
+                old = f'![{alt_text}]({img_url})'
+                new = f'![{alt_text}]({local_path})'
+                modified_content = modified_content.replace(old, new)
+            elif task_type == 'html':
+                # 替换 src="url" 和 src='url'
+                modified_content = modified_content.replace(f'src="{img_url}"', f'src="{local_path}"')
+                modified_content = modified_content.replace(f"src='{img_url}'", f"src='{local_path}'")
 
         return modified_content
-
 
 class JuejinAPI:
     """掘金API封装类"""
@@ -285,7 +316,15 @@ class BookletScraper:
         """准备输出结构：单文件 or 多文件目录"""
         safe_title = self._sanitize_filename(book_title)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-
+        # 单文件模式
+        # if self.merge_single_file:
+        #     if self.config.download_images:
+        #         img_dir = self.output_dir / "img"
+        #         self.image_downloader = ImageDownloader(self.api.session, img_dir, self.config)
+        # else:
+        #     if self.config.download_images:
+        #         img_dir = self.output_dir / "img"
+        #         self.image_downloader = ImageDownloader(self.api.session, img_dir, self.config)
         if self.merge_single_file:
             # 单文件模式
             file_path = self.output_dir / f"{safe_title}.md"
@@ -295,7 +334,7 @@ class BookletScraper:
             # 初始化图片下载器 - 图片保存在输出目录下的img文件夹
             if self.config.download_images:
                 img_dir = self.output_dir / "img"
-                self.image_downloader = ImageDownloader(self.api.session, img_dir)
+                self.image_downloader = ImageDownloader(self.api.session, img_dir,self.config)
 
             return file_path
         else:
@@ -306,7 +345,7 @@ class BookletScraper:
             # 初始化图片下载器 - 图片保存在书籍目录下的img文件夹
             if self.config.download_images:
                 img_dir = dir_path / "img"
-                self.image_downloader = ImageDownloader(self.api.session, img_dir)
+                self.image_downloader = ImageDownloader(self.api.session, img_dir,self.config)
 
             return dir_path
 
