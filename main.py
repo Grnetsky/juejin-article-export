@@ -18,9 +18,11 @@ from urllib.parse import urlparse, urljoin
 
 import requests
 import configparser
+
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from typing import List
 
 @dataclass
 class BookletConfig:
@@ -34,6 +36,7 @@ class BookletConfig:
     auto_all: bool = True
     merge_single_file: bool = True  # 新增：是否合并为单个文件
     download_images: bool = True  # 新增：是否下载图片
+    exclude: List[str] = None
 
 
 class ImageDownloader:
@@ -266,9 +269,16 @@ class BookletScraper:
         )
 
     def _sanitize_filename(self, filename: str) -> str:
-        """清理文件名，移除不合法字符"""
+        """清理文件名，移除不合法字符并去除首尾空白"""
         import re
+        # 移除 Windows 不允许的字符
         safe_name = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        # 去除首尾空白字符（包括空格、制表符等）
+        safe_name = safe_name.strip()
+        # 防止名字为空
+        if not safe_name:
+            safe_name = "untitled"
+        # 限制长度
         return safe_name[:100] if len(safe_name) > 100 else safe_name
 
     def _prepare_output_structure(self, book_title: str) -> Path:
@@ -440,6 +450,7 @@ def load_config(config_file: str = 'config.ini') -> BookletConfig:
         raise FileNotFoundError(f"配置文件 {config_file} 不存在")
 
     config.read(config_file, encoding='utf-8')
+    exclude = config.get('book','exclude').split(',')
 
     return BookletConfig(
         cookie=config.get('userinfo', 'cookie'),
@@ -451,6 +462,7 @@ def load_config(config_file: str = 'config.ini') -> BookletConfig:
         auto_all=config.getboolean('book', 'auto_all', fallback=True),
         merge_single_file=config.getboolean('out', 'merge_single_file', fallback=True),
         download_images=config.getboolean('out', 'download_images', fallback=True),  # 新增
+        exclude=exclude
     )
 
 
@@ -460,6 +472,8 @@ def main():
         scraper = BookletScraper(config)
         book_id_list = scraper.getBookList()
         for book_id in book_id_list:
+            if book_id in scraper.config.exclude:
+                continue
             scraper.scrape_booklet(book_id)
     except Exception as e:
         print(f"程序执行失败: {e}")
